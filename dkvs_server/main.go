@@ -64,13 +64,14 @@ func main() {
 		return
 	}
 
-	journalFile, err := os.OpenFile(params.LogPrefix + strconv.Itoa(params.NodeNum) + `.log`, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0775)
+
+	journalFilename := params.LogPrefix + strconv.Itoa(params.NodeNum) + `.log`
+	node, err := MakeNode(params.NodeNum, journalFilename, config)
 	if err != nil {
-		logErr.Println("Cannot open journal file:", err)
+		logErr.Println("Error while creating server instance:", err)
 		return
 	}
 
-	node := MakeNode(params.NodeNum, journalFile, config)
 	if err := node.Start(); err != nil {
 		logErr.Println(err)
 		node.Stop()
