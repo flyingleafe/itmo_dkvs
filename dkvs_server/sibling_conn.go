@@ -7,6 +7,11 @@ import (
 	"sync/atomic"
 	"time"
 	"io"
+	"strconv"
+	// "errors"
+	"fmt"
+	// "syscall"
+	"bufio"
 )
 
 type (
@@ -16,7 +21,8 @@ type (
 		fromConn  net.Conn
 		reqsChan  chan *RequestPack
 
-		addr     *dkvs.ServerAddr
+		number    int
+		addr      dkvs.ServerAddr
 		timeout   time.Duration
 
 		timer    *time.Timer
@@ -25,11 +31,12 @@ type (
 	}
 )
 
-func MakeSiblingConn(addr *dkvs.ServerAddr, timeout time.Duration) {
+func MakeSiblingConn(num int, addr dkvs.ServerAddr, timeout time.Duration) *SiblingConn {
 	return &SiblingConn{
 		toConn: nil,
 		fromConn: nil,
 		reqsChan: make(chan *RequestPack, 4096),
+		number: num,
 		addr: addr,
 		timeout: timeout,
 		timer: nil,
@@ -50,7 +57,10 @@ func (sc *SiblingConn) CloseTo() {
 	sc.Lock()
 	if sc.timer != nil {
 		if !sc.timer.Stop() {
-			<-sc.timer.C
+			select {
+			case <-sc.timer.C:
+			default:
+			}
 		}
 	}
 
@@ -80,20 +90,19 @@ func (sc *SiblingConn) Connect() error {
 	if sc.toConn == nil {
 		var err error
 		if sc.toConn, err = net.DialTimeout(`tcp4`, fmt.Sprintf(`%s:%d`, sc.addr.Host, sc.addr.Port), sc.timeout); err != nil {
+			logErr.Printf("Error while connecting to sibling %d: %s", sc.number, err)
+			sc.toConn = nil
 			return err
 		}
 		sc.timer = time.NewTimer(0)
-		if !sc.timer.Stop() {
-			<-sc.timer
-		}
 	}
 	return nil
 }
 
-func (sc *SiblingConn) Run() {
+func (sc *SiblingConn) Run(ownNum int) {
 	for {
 		isShut := atomic.LoadInt32(&sc.isShut)
-		if isShut {
+		if isShut == 1 {
 			break
 		}
 
@@ -102,20 +111,34 @@ func (sc *SiblingConn) Run() {
 			time.Sleep(sc.timeout) // Wait before attempt to reconnect
 		} else {
 
+			sc.InitConnection(ownNum)
+
+			if !sc.timer.Stop() {
+				<-sc.timer.C
+			}
+			sc.timer.Reset(sc.timeout - 10*time.Millisecond)
+
+			br := bufio.NewReader(sc.toConn)
+
+			var req *RequestPack
 			for {
-				req := nil
+				req = nil
 
 				select {
 				case req = <-sc.reqsChan:
-					if _, err := c.toConn.Write(dkvs.PrintMessage(req.msg) + "\n"); err != nil {
+					if _, err := sc.toConn.Write([]byte(dkvs.PrintMessage(req.msg) + "\n")); err != nil {
 						logErr.Println("Error while sending request to " + sc.toConn.RemoteAddr().String(), err)
-						continue
+						sc.CloseBoth()
+						break
 					}
+					logOk.Printf("SEND REQ to node %d: %s", sc.number, dkvs.PrintMessage(req.msg))
 				case <-sc.timer.C:
-					if _, err := c.toConn.Write("ping\n"); err != nil {
+					if _, err := sc.toConn.Write([]byte("ping\n")); err != nil {
 						logErr.Println("Error while sending ping to " + sc.toConn.RemoteAddr().String(), err)
-						continue
+						sc.CloseBoth()
+						break
 					}
+					logOk.Printf("SEND PING to node %d", sc.number)
 				}
 
 				sc.Lock()
@@ -126,28 +149,81 @@ func (sc *SiblingConn) Run() {
 
 				remoteAddr := sc.toConn.RemoteAddr().String()
 				sc.toConn.SetReadDeadline(time.Now().Add(sc.timeout))
-				msg, _, err := sc.toConn.ReadLine()
+				msg, _, err := br.ReadLine()
 				sc.Unlock()
 
 				if err == io.EOF {
 					logErr.Println("Sibling " + remoteAddr + " closed connection prematurely")
-					sc.CloseTo()
+					sc.CloseBoth()
+
+					if req != nil {
+						req.respBin <- "ERR " + err.Error()
+					}
 					break
 				} else if netop, ok := err.(*net.OpError); ok && netop.Timeout() {
 					logErr.Println("Read timeout " + remoteAddr)
 					sc.CloseBoth()
-					break
-				} else if err != nil {
-					logErr.Println("Error while getting response from sibling " + remoteAddr, err)
+
 					if req != nil {
 						req.respBin <- "ERR " + err.Error()
 					}
+					break
+				} else if err != nil {
+					logErr.Println("Error while getting response from sibling " + remoteAddr, err)
+					sc.CloseBoth()
+
+					if req != nil {
+						req.respBin <- "ERR " + err.Error()
+					}
+					break
 				}
 
+				logOk.Printf("RESP RECV from node %d: %s", sc.number, string(msg))
 				if req != nil {
-					req.respBin <- msg
+					req.respBin <- string(msg)
 				}
+
+				if !sc.timer.Stop() && req != nil {
+					<-sc.timer.C
+				}
+				sc.timer.Reset(sc.timeout - 10*time.Millisecond)
 			}
 		}
+	}
+}
+
+func (sc *SiblingConn) SendRequest(req *RequestPack) {
+	sc.reqsChan <- req
+}
+
+func (sc *SiblingConn) InitConnection(ownNum int) {
+	req := MakeRequest(dkvs.MNode, strconv.Itoa(ownNum))
+	sc.SendRequest(req)
+}
+
+func MakeSiblings(ownNumber int, config *dkvs.ServerConfig) (map[int]*SiblingConn) {
+	res := make(map[int]*SiblingConn)
+	for i, addr := range config.Nodes {
+		if i != ownNumber {
+			res[i] = MakeSiblingConn(i, addr, config.Timeout)
+		}
+	}
+	return res
+}
+
+func (node *ServerNode) TryConnectSiblings() int {
+	count := 0
+	for _, sib := range node.siblings {
+		err := sib.Connect()
+		if err == nil {
+			count++
+		}
+	}
+	return count
+}
+
+func (node *ServerNode) RunSiblings() {
+	for _, sib := range node.siblings {
+		go sib.Run(node.Number)
 	}
 }

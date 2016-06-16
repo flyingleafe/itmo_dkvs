@@ -3,13 +3,15 @@ package main
 import (
 	"time"
 	"io"
-	"os"
+	// "os"
 	"fmt"
 	"dkvs"
 	"net"
 	"bufio"
 	"sync/atomic"
 	"sync"
+	"strconv"
+	"strings"
 )
 
 type (
@@ -32,7 +34,7 @@ type (
 		incomingReqs   chan *RequestPack
 		serviceMsgs    chan *RequestPack
 
-
+		siblings     map[int]*SiblingConn
 
 		status       NodeStatus
 		statusChan   chan bool
@@ -52,8 +54,16 @@ const (
 	Recovering
 )
 
+func MakeRequest(tp dkvs.MessageType, params ...string) *RequestPack {
+	return &RequestPack{
+		msg: dkvs.MakeMessage(tp, params...),
+		opNum: -1,
+		respBin: make(chan string, 1),
+	}
+}
+
 // Initialize data structure for server node
-func MakeNode(num int, journalFilename sting, config *dkvs.ServerConfig) (*ServerNode, error) {
+func MakeNode(num int, journalFilename string, config *dkvs.ServerConfig) (*ServerNode, error) {
 	journal, err := MakeJournal(journalFilename)
 	if err != nil {
 		return nil, err
@@ -67,14 +77,14 @@ func MakeNode(num int, journalFilename sting, config *dkvs.ServerConfig) (*Serve
 		needStop:     0,
 		incomingReqs: make(chan *RequestPack, 4096),
 		serviceMsgs:  make(chan *RequestPack, 4096),
+		siblings:     MakeSiblings(num, config),
 		status:       Recovering,
 		statusChan:   make(chan bool, 1),
 		statusLock:   sync.RWMutex{},
-		leaderNumber: 0,
+		leaderNumber: 1,
 		viewNumber:   0,
 		opNumber:     0,
 		commitNumber: 0,
-		clientTable:  make(map[string]ClientInfo),
 	}, nil
 }
 
@@ -89,6 +99,13 @@ func (node *ServerNode) Start() error {
 	ln, err := net.Listen(`tcp4`, fmt.Sprintf(`%s:%d`, myAddr.Host, myAddr.Port))
 	if err != nil {
 		return err
+	}
+
+	aliveCount := node.TryConnectSiblings()
+	node.RunSiblings()
+
+	if aliveCount >= (len(node.siblings) + 1) / 2 {
+		logOk.Println("TODO: start recovery here")
 	}
 
 	node.listener = ln
@@ -142,6 +159,10 @@ func (node *ServerNode) Interact(conn net.Conn) {
 		if err == io.EOF {
 			break
 		} else if err != nil {
+			if strings.Contains(err.Error(), "use of closed network connection") {
+				break
+			}
+
 			logErr.Println(`Error while receiving message:`, err)
 			continue
 		}
@@ -154,6 +175,20 @@ func (node *ServerNode) Interact(conn net.Conn) {
 		}
 
 		logOk.Printf("QUERY (%s): %s\n", conn.RemoteAddr().String(), msg)
+
+		if mesg.Type == dkvs.MNode {
+			// This is sibling node wants to connect
+			nodeNum, err := strconv.Atoi(mesg.Params[0])
+			if err != nil {
+				logErr.Println("Invalid node number:", err)
+				conn.Write([]byte("ERR " + err.Error() + "\n"))
+				continue
+			}
+
+			conn.Write([]byte("ACCEPTED\n"))
+			node.InteractSibling(nodeNum, conn)
+			break
+		}
 
 		curOpNum := int64(-1)
 		if dkvs.IsChangingOp(mesg) {
@@ -180,6 +215,55 @@ func (node *ServerNode) Interact(conn net.Conn) {
 	conn.Close()
 }
 
+func (node *ServerNode) InteractSibling(num int, conn net.Conn) {
+
+	node.siblings[num].fromConn = conn
+	br := bufio.NewReader(conn)
+
+	needStop := atomic.LoadInt32(&node.needStop)
+	for ; needStop != 1; needStop = atomic.LoadInt32(&node.needStop) {
+		msg, _, err := br.ReadLine()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			if strings.Contains(err.Error(), "use of closed network connection") {
+				logErr.Println("Connection is already closed")
+				break
+			}
+			logErr.Println(`Error while receiving message:`, err)
+			continue
+		}
+
+		mesg, err := dkvs.ParseMessage(string(msg))
+		if err != nil {
+			logErr.Println(`Invalid message:`, err)
+			conn.Write([]byte("ERR " + err.Error() + "\n"))
+			continue
+		}
+
+		logOk.Printf("SERVICE QUERY (%s): %s\n", conn.RemoteAddr().String(), msg)
+
+		pack := &RequestPack{
+			msg:     mesg,
+			opNum:   -1,
+			respBin: make(chan string, 1),
+		}
+
+		if dkvs.IsServiceMsg(mesg) {
+			node.serviceMsgs <- pack
+		} else {
+			node.incomingReqs <- pack
+		}
+		ans := <-pack.respBin
+
+		_, err = conn.Write([]byte(ans + "\n"))
+		if err != nil {
+			logErr.Println(`Error while answering query:`, err)
+			continue
+		}
+	}
+}
+
 // Process all the messages
 func (node *ServerNode) ProcessMsgs() {
 	for req := range node.incomingReqs {
@@ -199,7 +283,10 @@ func (node *ServerNode) ProcessMsgs() {
 			req.respBin <- node.PerformAction(req.msg)
 		} else {
 			if node.Number == node.leaderNumber {
-
+				// TODO: make commits
+				req.respBin <- node.PerformAction(req.msg)
+			} else {
+				node.siblings[node.leaderNumber].SendRequest(req)
 			}
 		}
 		node.statusLock.RUnlock()

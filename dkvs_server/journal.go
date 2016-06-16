@@ -5,6 +5,8 @@ import (
 	"sync"
 	"io"
 	"dkvs"
+	"fmt"
+	"bufio"
 )
 
 type (
@@ -15,7 +17,7 @@ type (
 	}
 )
 
-func MakeJournal(filename string) (*Journal, error) {
+func MakeJournal(filename string) (*NodeJournal, error) {
 	file, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0775)
 	if err != nil {
 		return nil, err
@@ -29,8 +31,8 @@ func MakeJournal(filename string) (*Journal, error) {
 
 func (node *ServerNode) WriteToJournal(req *RequestPack) {
 	node.Journal.Lock()
-	fmt.Fprintln(j.file, dkvs.PrintMessage(req.msg))
-	node.Jounal.Unlock()
+	fmt.Fprintln(node.Journal.file, dkvs.PrintMessage(req.msg))
+	node.Journal.Unlock()
 }
 
 func (node *ServerNode) RestoreFromJournal() error {
@@ -80,7 +82,7 @@ func (node *ServerNode) SubstituteJournal(src io.Reader) error {
 		node.Journal.file, err = os.OpenFile(node.Journal.filename, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0775)
 	}()
 
-	_, err := io.Copy(node.Journal.file, src)
+	_, err = io.Copy(node.Journal.file, src)
 	if err != nil {
 		return err
 	}
