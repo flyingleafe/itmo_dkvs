@@ -111,7 +111,11 @@ func (sc *SiblingConn) Run(ownNum int) {
 			time.Sleep(sc.timeout) // Wait before attempt to reconnect
 		} else {
 
-			sc.InitConnection(ownNum)
+			if err := sc.InitConnection(ownNum); err != nil {
+				logErr.Println("Sibling handshake failed:", err)
+				sc.CloseTo()
+				continue
+			}
 
 			if !sc.timer.Stop() {
 				<-sc.timer.C
@@ -205,9 +209,30 @@ func (sc *SiblingConn) SendRequest(req *RequestPack) bool {
 	return false
 }
 
-func (sc *SiblingConn) InitConnection(ownNum int) {
-	req := MakeRequest(dkvs.MNode, strconv.Itoa(ownNum))
-	sc.SendRequest(req)
+// Synchronous handshake
+func (sc *SiblingConn) InitConnection(ownNum int) error {
+	sc.RLock()
+	defer sc.RUnlock()
+
+	msg := dkvs.MakeMessage(dkvs.MNode, strconv.Itoa(ownNum))
+	_, err := sc.toConn.Write([]byte(dkvs.PrintMessage(msg) + "\n"))
+	if err != nil {
+		return err
+	}
+
+	sc.toConn.SetReadDeadline(time.Now().Add(sc.timeout))
+
+	br := bufio.NewReader(sc.toConn)
+	ans, _, err := br.ReadLine()
+	if err != nil {
+		return err
+	}
+
+	if string(ans) != "ACCEPTED" {
+		return fmt.Errorf("Unexpected handshake answer: %s", ans)
+	}
+
+	return nil
 }
 
 func MakeSiblings(ownNumber int, config *dkvs.ServerConfig) (map[int]*SiblingConn) {

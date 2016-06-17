@@ -105,9 +105,9 @@ func (node *ServerNode) Start() error {
 	aliveCount := node.TryConnectSiblings()
 	node.RunSiblings()
 
-	if aliveCount >= (len(node.siblings) + 1) / 2 {
-		logOk.Println("TODO: start recovery here")
-		// node.RecoveryNode()
+	if aliveCount > (len(node.siblings) + 1) / 2 {
+		logOk.Println("Start recovering of state from nodes")
+		node.RecoveryNode()
 	}
 
 	node.listener = ln
@@ -459,9 +459,7 @@ func (node *ServerNode) CommitRequestToAll(req *RequestPack) {
 
 		countReady := 0
 		for i := 0; i < len(node.siblings); i++ {
-			logOk.Println("SOOOO")
 			resp := <-agg
-			logOk.Println("AGGREGATED DAT")
 			if vn, on, _, err := dkvs.ParsePrepareOk(resp); err == nil && vn == viewNum && on == req.opNum {
 				countReady++
 				if countReady >= f {
@@ -470,8 +468,6 @@ func (node *ServerNode) CommitRequestToAll(req *RequestPack) {
 			}
 		}
 	}
-
-	logOk.Println("YAHOOOOOOOOOOOOOOO")
 
 	resp := node.PerformAction(req.msg)
 	atomic.AddInt64(&node.commitNumber, 1)
@@ -499,9 +495,7 @@ func (node *ServerNode) RecoveryNode() {
 		hadLeader := false
 
 		for i := 0; i < len(node.siblings); i++ {
-			logOk.Println("SOOOOO")
 			resp := <-agg
-			logOk.Println("AGGREGATED DAT")
 			nnum, theirNonce, vnum, opnum, comnum, logOut, err := dkvs.ParseRecoveryResponse(resp)
 			if err == nil && nonce == theirNonce {
 				countReady++
