@@ -46,6 +46,8 @@ type (
 		viewNumber   int64 // View number
 		opNumber     int64 // Number of last view-changing operation request (set/delete)
 		commitNumber int64 // Number of last commited change
+
+		commitTimer *time.Timer
 	}
 )
 
@@ -86,6 +88,7 @@ func MakeNode(num int, journalFilename string, config *dkvs.ServerConfig) (*Serv
 		viewNumber:   0,
 		opNumber:     0,
 		commitNumber: 0,
+		commitTimer:  nil,
 	}, nil
 }
 
@@ -281,7 +284,7 @@ func (node *ServerNode) ProcessMsgs() {
 		} else {
 			if node.Number == node.leaderNumber {
 				node.WriteToJournal(req)
-				go node.CommitRequestToAll(req)
+				go node.PrepareRequestToAll(req)
 			} else {
 				node.siblings[node.leaderNumber].SendRequest(req)
 			}
@@ -318,9 +321,43 @@ func (node *ServerNode) PerformAction(m *dkvs.Message) string {
 
 // Process all service messages
 func (node *ServerNode) ProcessServiceMsgs() {
+	node.resetCommitTimer()
+	go func() {
+		needStop := atomic.LoadInt32(&node.needStop)
+		for ; needStop != 1; needStop = atomic.LoadInt32(&node.needStop) {
+			node.commitByTimer()
+		}
+	}()
+
 	for req := range node.serviceMsgs {
 		node.statusLock.RLock()
 		node.ProcessServiceMsg(req)
+		node.statusLock.RUnlock()
+	}
+}
+
+func (node *ServerNode) resetCommitTimer() {
+	if node.commitTimer == nil {
+		node.commitTimer = time.NewTimer(node.Config.Timeout)
+	} else {
+		if !node.commitTimer.Stop() {
+			select {
+			case <-node.commitTimer.C:
+			default:
+			}
+		}
+		node.commitTimer.Reset(node.Config.Timeout)
+	}
+}
+
+func (node *ServerNode) commitByTimer() {
+	if node.GetLeaderNumber() == node.Number {
+		<-node.commitTimer.C
+		node.CommitToAll()
+		node.resetCommitTimer()
+	} else {
+		node.statusLock.RLock()
+		node.WaitForStatus(ViewChange)
 		node.statusLock.RUnlock()
 	}
 }
@@ -390,6 +427,35 @@ func (node *ServerNode) ProcessServiceMsg(req *RequestPack) {
 				req.respBin <- responseMsg
 			}()
 		}
+
+	case dkvs.MCommit:
+		node.WaitForStatus(Normal)
+
+		vnum, _ := strconv.ParseInt(m.Params[0], 10, 64)
+		cnum, _ := strconv.ParseInt(m.Params[1], 10, 64)
+
+		vNum := atomic.LoadInt64(&node.viewNumber)
+		if vNum != vnum {
+			req.respBin <- "ERR Wrong view"
+			break
+		}
+
+		opNum := atomic.LoadInt64(&node.opNumber)
+		comNum := atomic.LoadInt64(&node.commitNumber)
+
+		if comNum < cnum {
+			if cnum == opNum {
+				node.CommitTail(cnum)
+				req.respBin <- "OK"
+			} else {
+				go func(){
+					node.RecoveryNode()
+					node.ChangeStatus(Normal)
+					req.respBin <- "OK"
+				}()
+			}
+		}
+		req.respBin <- "OK"
 	}
 }
 
@@ -442,7 +508,7 @@ func (node *ServerNode) SetLeaderNumber(newLeader int) {
 	node.statusLock.RUnlock()
 }
 
-func (node *ServerNode) CommitRequestToAll(req *RequestPack) {
+func (node *ServerNode) PrepareRequestToAll(req *RequestPack) {
 	comNum := atomic.LoadInt64(&node.commitNumber)
 	viewNum := atomic.LoadInt64(&node.viewNumber)
 
@@ -452,6 +518,8 @@ func (node *ServerNode) CommitRequestToAll(req *RequestPack) {
 		strconv.FormatInt(comNum, 10),
 		dkvs.PrintMessage(req.msg),
 	)
+
+	node.resetCommitTimer()
 
 	OuterLoop: for {
 		agg := node.BroadcastMessage(msg)
@@ -472,6 +540,20 @@ func (node *ServerNode) CommitRequestToAll(req *RequestPack) {
 	resp := node.PerformAction(req.msg)
 	atomic.AddInt64(&node.commitNumber, 1)
 	req.respBin <- resp
+	node.resetCommitTimer()
+}
+
+func (node *ServerNode) CommitToAll() {
+	comNum := atomic.LoadInt64(&node.commitNumber)
+	viewNum := atomic.LoadInt64(&node.viewNumber)
+
+	msg := dkvs.MakeMessage(dkvs.MCommit,
+		strconv.FormatInt(viewNum, 10),
+		strconv.FormatInt(comNum, 10),
+	)
+
+	logOk.Println("COMMIT BROADCAST")
+	node.BroadcastMessage(msg)
 }
 
 func (node *ServerNode) RecoveryNode() {
@@ -496,10 +578,10 @@ func (node *ServerNode) RecoveryNode() {
 
 		for i := 0; i < len(node.siblings); i++ {
 			resp := <-agg
-			nnum, theirNonce, vnum, opnum, comnum, logOut, err := dkvs.ParseRecoveryResponse(resp)
+			_, theirNonce, vnum, opnum, comnum, logOut, err := dkvs.ParseRecoveryResponse(resp)
 			if err == nil && nonce == theirNonce {
 				countReady++
-				if nnum == node.GetLeaderNumber() {
+				if comnum != -1 {
 					vNum = vnum
 					opNum = opnum
 					comNum = comnum

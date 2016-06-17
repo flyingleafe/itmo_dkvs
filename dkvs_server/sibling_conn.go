@@ -272,11 +272,8 @@ func (node *ServerNode) BroadcastMessage(msg *dkvs.Message) chan string {
 			respBin: make(chan string, 1),
 		}
 
-		logOk.Println("COME ON MUTHAFUCKER")
 		go func(rq *RequestPack) {
-			logOk.Println("HEEEEY BITCH")
 			s := <-rq.respBin
-			logOk.Println("GOTCHAAAA")
 			aggregator <- s
 		}(req)
 

@@ -3,6 +3,8 @@ package dkvs
 import (
 	"strings"
 	"fmt"
+	"errors"
+	"strconv"
 )
 
 type (
@@ -93,6 +95,11 @@ func msgTypeToString(t MessageType) string {
 	return "ping"
 }
 
+
+func MakeMessage(tp MessageType, params ...string) *Message {
+	return &Message{tp, params}
+}
+
 func ParseMessage(s string) (*Message, error) {
 	parts := strings.SplitN(s, " ", 2)
 	if len(parts) < 1 {
@@ -129,9 +136,15 @@ func ParseMessage(s string) (*Message, error) {
 		needArgs = 2
 	case MRecoveryResponse:
 		needArgs = 6
+	case MNode:
+		needArgs = 1
 	}
 
-	args := strings.SplitN(parts[0], " ", needArgs)
+	args := []string{}
+
+	if len(parts) > 1 {
+		args = strings.SplitN(parts[1], " ", needArgs)
+	}
 
 	if len(args) != needArgs {
 		return nil, fmt.Errorf("Wrong number of arguments for method: %s", s)
@@ -149,4 +162,39 @@ func IsChangingOp(m *Message) bool {
 
 func IsServiceMsg(m *Message) bool {
 	return m != nil && (m.Type > 4)
+}
+
+func IsErrResp(resp string) bool {
+	return strings.HasPrefix(resp, "ERR")
+}
+
+func ParsePrepareOk(resp string) (int64, int64, int64, error) {
+	msg, err := ParseMessage(resp)
+	if err != nil {
+		return -1, -1, -1, err
+	} else if msg.Type != MPrepareOk {
+		return -1, -1, -1, errors.New("Not a PrepareOk response")
+	}
+
+	vnum, _ := strconv.ParseInt(msg.Params[0], 10, 64)
+	opnum, _ := strconv.ParseInt(msg.Params[1], 10, 64)
+	nodenum, _ := strconv.ParseInt(msg.Params[2], 10, 64)
+	return vnum, opnum, nodenum, nil
+}
+
+func ParseRecoveryResponse(resp string) (int, string, int64, int64, int64, string, error) {
+	msg, err := ParseMessage(resp)
+	if err != nil {
+		return -1, "", -1, -1, -1, "", err
+	} else if msg.Type != MRecoveryResponse {
+		return -1, "", -1, -1, -1, "", errors.New("Not a RecoveryResponse")
+	}
+
+	nodenum, _ := strconv.Atoi(msg.Params[0])
+	nonce := msg.Params[1]
+	vnum, _ := strconv.ParseInt(msg.Params[2], 10, 64)
+	opnum, _ := strconv.ParseInt(msg.Params[3], 10, 64)
+	comnum, _ := strconv.ParseInt(msg.Params[4], 10, 64)
+	log := msg.Params[5]
+	return nodenum, nonce, vnum, opnum, comnum, log, nil
 }
