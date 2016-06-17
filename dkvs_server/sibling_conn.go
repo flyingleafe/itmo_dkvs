@@ -16,7 +16,7 @@ import (
 
 type (
 	SiblingConn struct {
-		sync.Mutex
+		sync.RWMutex
 		toConn    net.Conn
 		fromConn  net.Conn
 		reqsChan  chan *RequestPack
@@ -129,6 +129,7 @@ func (sc *SiblingConn) Run(ownNum int) {
 					if _, err := sc.toConn.Write([]byte(dkvs.PrintMessage(req.msg) + "\n")); err != nil {
 						logErr.Println("Error while sending request to " + sc.toConn.RemoteAddr().String(), err)
 						sc.CloseBoth()
+						req.respBin <- "ERR " + err.Error()
 						break
 					}
 					logOk.Printf("SEND REQ to node %d: %s", sc.number, dkvs.PrintMessage(req.msg))
@@ -141,16 +142,16 @@ func (sc *SiblingConn) Run(ownNum int) {
 					logOk.Printf("SEND PING to node %d", sc.number)
 				}
 
-				sc.Lock()
+				sc.RLock()
 				if sc.toConn == nil {
-					sc.Unlock()
+					sc.RUnlock()
 					continue
 				}
 
 				remoteAddr := sc.toConn.RemoteAddr().String()
 				sc.toConn.SetReadDeadline(time.Now().Add(sc.timeout))
 				msg, _, err := br.ReadLine()
-				sc.Unlock()
+				sc.RUnlock()
 
 				if err == io.EOF {
 					logErr.Println("Sibling " + remoteAddr + " closed connection prematurely")
@@ -192,8 +193,16 @@ func (sc *SiblingConn) Run(ownNum int) {
 	}
 }
 
-func (sc *SiblingConn) SendRequest(req *RequestPack) {
-	sc.reqsChan <- req
+func (sc *SiblingConn) SendRequest(req *RequestPack) bool {
+	sc.RLock()
+	defer sc.RUnlock()
+
+	if sc.toConn != nil {
+		sc.reqsChan <- req
+		return true
+	}
+	req.respBin <- "ERR Connection to sibling is not established"
+	return false
 }
 
 func (sc *SiblingConn) InitConnection(ownNum int) {
@@ -226,4 +235,27 @@ func (node *ServerNode) RunSiblings() {
 	for _, sib := range node.siblings {
 		go sib.Run(node.Number)
 	}
+}
+
+func (node *ServerNode) BroadcastMessage(msg *dkvs.Message) chan string {
+	aggregator := make(chan string, len(node.siblings))
+	for _, sib := range node.siblings {
+
+		req := &RequestPack{
+			msg: msg,
+			opNum: -1,
+			respBin: make(chan string, 1),
+		}
+
+		logOk.Println("COME ON MUTHAFUCKER")
+		go func(rq *RequestPack) {
+			logOk.Println("HEEEEY BITCH")
+			s := <-rq.respBin
+			logOk.Println("GOTCHAAAA")
+			aggregator <- s
+		}(req)
+
+		sib.SendRequest(req)
+	}
+	return aggregator
 }

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"strconv"
 	"strings"
+	"bytes"
 )
 
 type (
@@ -90,7 +91,7 @@ func MakeNode(num int, journalFilename string, config *dkvs.ServerConfig) (*Serv
 
 // Start server: read journal and listen to connections
 func (node *ServerNode) Start() error {
-	if err := node.RestoreFromJournal(); err != nil {
+	if err := node.RestoreFromJournal(-1); err != nil {
 		return err
 	}
 
@@ -106,6 +107,7 @@ func (node *ServerNode) Start() error {
 
 	if aliveCount >= (len(node.siblings) + 1) / 2 {
 		logOk.Println("TODO: start recovery here")
+		// node.RecoveryNode()
 	}
 
 	node.listener = ln
@@ -146,6 +148,39 @@ func (node *ServerNode) Stop() {
 	node.listener = nil
 }
 
+func (node *ServerNode) takeMessage(br *bufio.Reader, conn net.Conn) (*dkvs.Message, bool, error) {
+	msg, _, err := br.ReadLine()
+	if err == io.EOF {
+		return nil, true, err
+	} else if err != nil {
+		if strings.Contains(err.Error(), "use of closed network connection") {
+			logErr.Println("Connection is already closed")
+			return nil, true, err
+		}
+		logErr.Println(`Error while receiving message:`, err)
+		return nil, false, err
+	}
+
+	mesg, err := dkvs.ParseMessage(string(msg))
+	if err != nil {
+		logErr.Println(`Invalid message:`, err)
+		conn.Write([]byte("ERR " + err.Error() + "\n"))
+		return nil, false, err
+	}
+
+	logOk.Printf("QUERY (%s): %s\n", conn.RemoteAddr().String(), msg)
+	return mesg, false, nil
+}
+
+func (node *ServerNode) sendResponse(conn net.Conn, ans string) {
+	logOk.Printf("RESPONSE (%s): %s\n", conn.RemoteAddr().String(), ans)
+
+	_, err := conn.Write([]byte(ans + "\n"))
+	if err != nil {
+		logErr.Println(`Error while answering query:`, err)
+	}
+}
+
 // Interact with one of connections
 func (node *ServerNode) Interact(conn net.Conn) {
 	logOk.Println("Starting interaction with", conn.RemoteAddr().String())
@@ -155,26 +190,13 @@ func (node *ServerNode) Interact(conn net.Conn) {
 
 	needStop := atomic.LoadInt32(&node.needStop)
 	for ; needStop != 1; needStop = atomic.LoadInt32(&node.needStop) {
-		msg, _, err := br.ReadLine()
-		if err == io.EOF {
-			break
-		} else if err != nil {
-			if strings.Contains(err.Error(), "use of closed network connection") {
+		mesg, toBreak, err := node.takeMessage(br, conn)
+		if err != nil {
+			if toBreak {
 				break
 			}
-
-			logErr.Println(`Error while receiving message:`, err)
 			continue
 		}
-
-		mesg, err := dkvs.ParseMessage(string(msg))
-		if err != nil {
-			logErr.Println(`Invalid message:`, err)
-			conn.Write([]byte("ERR " + err.Error() + "\n"))
-			continue
-		}
-
-		logOk.Printf("QUERY (%s): %s\n", conn.RemoteAddr().String(), msg)
 
 		if mesg.Type == dkvs.MNode {
 			// This is sibling node wants to connect
@@ -191,7 +213,7 @@ func (node *ServerNode) Interact(conn net.Conn) {
 		}
 
 		curOpNum := int64(-1)
-		if dkvs.IsChangingOp(mesg) {
+		if node.Number == node.GetLeaderNumber() && dkvs.IsChangingOp(mesg) {
 			curOpNum = atomic.AddInt64(&node.opNumber, 1)
 		}
 
@@ -203,12 +225,7 @@ func (node *ServerNode) Interact(conn net.Conn) {
 
 		node.incomingReqs <- pack
 		ans := <-pack.respBin
-
-		_, err = conn.Write([]byte(ans + "\n"))
-		if err != nil {
-			logErr.Println(`Error while answering query:`, err)
-			continue
-		}
+		node.sendResponse(conn, ans)
 	}
 
 	logOk.Println("Closing connection with", conn.RemoteAddr().String())
@@ -222,30 +239,22 @@ func (node *ServerNode) InteractSibling(num int, conn net.Conn) {
 
 	needStop := atomic.LoadInt32(&node.needStop)
 	for ; needStop != 1; needStop = atomic.LoadInt32(&node.needStop) {
-		msg, _, err := br.ReadLine()
-		if err == io.EOF {
-			break
-		} else if err != nil {
-			if strings.Contains(err.Error(), "use of closed network connection") {
-				logErr.Println("Connection is already closed")
+		mesg, toBreak, err := node.takeMessage(br, conn)
+		if err != nil {
+			if toBreak {
 				break
 			}
-			logErr.Println(`Error while receiving message:`, err)
 			continue
 		}
 
-		mesg, err := dkvs.ParseMessage(string(msg))
-		if err != nil {
-			logErr.Println(`Invalid message:`, err)
-			conn.Write([]byte("ERR " + err.Error() + "\n"))
-			continue
+		curOpNum := int64(-1)
+		if node.Number == node.GetLeaderNumber() && dkvs.IsChangingOp(mesg) {
+			curOpNum = atomic.AddInt64(&node.opNumber, 1)
 		}
-
-		logOk.Printf("SERVICE QUERY (%s): %s\n", conn.RemoteAddr().String(), msg)
 
 		pack := &RequestPack{
 			msg:     mesg,
-			opNum:   -1,
+			opNum:   curOpNum,
 			respBin: make(chan string, 1),
 		}
 
@@ -255,12 +264,7 @@ func (node *ServerNode) InteractSibling(num int, conn net.Conn) {
 			node.incomingReqs <- pack
 		}
 		ans := <-pack.respBin
-
-		_, err = conn.Write([]byte(ans + "\n"))
-		if err != nil {
-			logErr.Println(`Error while answering query:`, err)
-			continue
-		}
+		node.sendResponse(conn, ans)
 	}
 }
 
@@ -270,21 +274,14 @@ func (node *ServerNode) ProcessMsgs() {
 		node.statusLock.RLock()
 
 		// Make sure that current status is Normal before processing client request
-		for {
-			if node.status == Normal {
-				break
-			}
-			node.statusLock.RUnlock()
-			<-node.statusChan
-			node.statusLock.RLock()
-		}
+		node.WaitForStatus(Normal)
 
 		if !dkvs.IsChangingOp(req.msg) {
 			req.respBin <- node.PerformAction(req.msg)
 		} else {
 			if node.Number == node.leaderNumber {
-				// TODO: make commits
-				req.respBin <- node.PerformAction(req.msg)
+				node.WriteToJournal(req)
+				go node.CommitRequestToAll(req)
 			} else {
 				node.siblings[node.leaderNumber].SendRequest(req)
 			}
@@ -329,7 +326,85 @@ func (node *ServerNode) ProcessServiceMsgs() {
 }
 
 func (node *ServerNode) ProcessServiceMsg(req *RequestPack) {
+	m := req.msg
+	switch m.Type {
+	case dkvs.MRecovery:
 
+		// Start recovery only from normal status
+		node.WaitForStatus(Normal)
+
+		// nodeNum := m.Params[0]
+		nonce := m.Params[1]
+		vnum := atomic.LoadInt64(&node.viewNumber)
+		opNum := int64(-1)
+		comNum := int64(-1)
+		log := ""
+		if node.Number == node.leaderNumber {
+			opNum = atomic.LoadInt64(&node.opNumber)
+			comNum = atomic.LoadInt64(&node.commitNumber)
+			log, _ = node.FetchJournal()
+		}
+		respMsg := dkvs.MakeMessage(dkvs.MRecoveryResponse,
+			strconv.Itoa(node.Number),
+			nonce,
+			strconv.FormatInt(vnum, 10),
+			strconv.FormatInt(opNum, 10),
+			strconv.FormatInt(comNum, 10),
+			log,
+		)
+		req.respBin <- dkvs.PrintMessage(respMsg)
+
+	case dkvs.MPrepare:
+		// Commit changes only from normal status
+		node.WaitForStatus(Normal)
+
+		vnum, _ := strconv.ParseInt(m.Params[0], 10, 64)
+		onum, _ := strconv.ParseInt(m.Params[1], 10, 64)
+		cnum, _ := strconv.ParseInt(m.Params[2], 10, 64)
+
+		preparedMsg, _ := dkvs.ParseMessage(m.Params[3])
+		vNum := atomic.LoadInt64(&node.viewNumber)
+		if vNum != vnum {
+			req.respBin <- "ERR Wrong view"
+			break
+		}
+
+		opNum := atomic.LoadInt64(&node.opNumber)
+
+		responseMsg := dkvs.PrintMessage(dkvs.MakeMessage(
+			dkvs.MPrepareOk,
+			strconv.FormatInt(vNum, 10),
+			strconv.FormatInt(opNum + 1, 10),
+			strconv.Itoa(node.Number),
+		))
+
+		if onum - 1 == opNum {
+			node.CommitTail(cnum)
+			opNum = atomic.AddInt64(&node.opNumber, 1)
+			node.WriteToJournal(&RequestPack{preparedMsg, opNum, nil})
+			req.respBin <- responseMsg
+		} else {
+			go func(){
+				node.RecoveryNode()
+				node.ChangeStatus(Normal)
+				req.respBin <- responseMsg
+			}()
+		}
+	}
+}
+
+// ACHTUNG! Only to be used while statusLock is LOCKED!
+func (node *ServerNode) WaitForStatus(statuses ...NodeStatus) {
+	OuterLoop: for {
+		for _, st := range statuses {
+			if node.status == st {
+				break OuterLoop
+			}
+		}
+		node.statusLock.RUnlock()
+		<-node.statusChan
+		node.statusLock.RLock()
+	}
 }
 
 func (node *ServerNode) ChangeStatus(newStatus NodeStatus) {
@@ -343,4 +418,115 @@ func (node *ServerNode) ChangeStatus(newStatus NodeStatus) {
 	if prevStatus != newStatus {
 		node.statusChan <- true
 	}
+}
+
+func (node *ServerNode) GetStatus() NodeStatus {
+	node.statusLock.RLock()
+	res := node.status
+	node.statusLock.RUnlock()
+	return res
+}
+
+func (node *ServerNode) GetLeaderNumber() int {
+	node.statusLock.RLock()
+	node.WaitForStatus(Normal, Recovering)
+	lnum := node.leaderNumber
+	node.statusLock.RUnlock()
+	return lnum
+}
+
+func (node *ServerNode) SetLeaderNumber(newLeader int) {
+	node.statusLock.RLock()
+	node.WaitForStatus(ViewChange)
+	node.leaderNumber = newLeader
+	node.statusLock.RUnlock()
+}
+
+func (node *ServerNode) CommitRequestToAll(req *RequestPack) {
+	comNum := atomic.LoadInt64(&node.commitNumber)
+	viewNum := atomic.LoadInt64(&node.viewNumber)
+
+	msg := dkvs.MakeMessage(dkvs.MPrepare,
+		strconv.FormatInt(viewNum, 10),
+		strconv.FormatInt(req.opNum, 10),
+		strconv.FormatInt(comNum, 10),
+		dkvs.PrintMessage(req.msg),
+	)
+
+	OuterLoop: for {
+		agg := node.BroadcastMessage(msg)
+		f := (len(node.siblings) + 1) / 2
+
+		countReady := 0
+		for i := 0; i < len(node.siblings); i++ {
+			logOk.Println("SOOOO")
+			resp := <-agg
+			logOk.Println("AGGREGATED DAT")
+			if vn, on, _, err := dkvs.ParsePrepareOk(resp); err == nil && vn == viewNum && on == req.opNum {
+				countReady++
+				if countReady >= f {
+					break OuterLoop
+				}
+			}
+		}
+	}
+
+	logOk.Println("YAHOOOOOOOOOOOOOOO")
+
+	resp := node.PerformAction(req.msg)
+	atomic.AddInt64(&node.commitNumber, 1)
+	req.respBin <- resp
+}
+
+func (node *ServerNode) RecoveryNode() {
+	node.ChangeStatus(Recovering)
+	nonce := dkvs.RandSeq(10)
+	msg := dkvs.MakeMessage(dkvs.MRecovery, strconv.Itoa(node.Number), nonce)
+
+	log := ""
+	vNum := int64(-1)
+	opNum := int64(-1)
+	comNum := int64(-1)
+
+	retries := 0
+	OuterLoop: for {
+		logOk.Printf("Recovery broadcast retry #%d", retries)
+
+		agg := node.BroadcastMessage(msg)
+		f := (len(node.siblings) + 1) / 2
+
+		countReady := 0
+		hadLeader := false
+
+		for i := 0; i < len(node.siblings); i++ {
+			logOk.Println("SOOOOO")
+			resp := <-agg
+			logOk.Println("AGGREGATED DAT")
+			nnum, theirNonce, vnum, opnum, comnum, logOut, err := dkvs.ParseRecoveryResponse(resp)
+			if err == nil && nonce == theirNonce {
+				countReady++
+				if nnum == node.GetLeaderNumber() {
+					vNum = vnum
+					opNum = opnum
+					comNum = comnum
+					log = logOut
+					hadLeader = true
+				}
+				if hadLeader && countReady > f {
+					break OuterLoop
+				}
+			}
+		}
+		retries++
+	}
+
+	newLog := []byte(strings.Replace(log, ";", "\n", -1))
+	node.SubstituteJournal(bytes.NewBuffer(newLog))
+	node.RestoreFromJournal(comNum)
+
+	atomic.StoreInt64(&node.viewNumber, vNum)
+	atomic.StoreInt64(&node.opNumber, opNum)
+	atomic.StoreInt64(&node.commitNumber, comNum)
+
+	logOk.Println("Recovery completed")
 }
