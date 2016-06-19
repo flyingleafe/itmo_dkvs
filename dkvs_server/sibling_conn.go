@@ -39,7 +39,6 @@ func MakeSiblingConn(num int, addr dkvs.ServerAddr, timeout time.Duration) *Sibl
 		number: num,
 		addr: addr,
 		timeout: timeout,
-		timer: nil,
 		isShut: 0,
 	}
 }
@@ -55,14 +54,6 @@ func (sc *SiblingConn) CloseFrom() {
 
 func (sc *SiblingConn) CloseTo() {
 	sc.Lock()
-	if sc.timer != nil {
-		if !sc.timer.Stop() {
-			select {
-			case <-sc.timer.C:
-			default:
-			}
-		}
-	}
 
 	if sc.toConn != nil {
 		sc.toConn.Close()
@@ -80,7 +71,6 @@ func (sc *SiblingConn) Shutdown() {
 	atomic.CompareAndSwapInt32(&sc.isShut, 0, 1)
 	close(sc.reqsChan)
 	sc.CloseBoth()
-	sc.timer = nil
 }
 
 func (sc *SiblingConn) Connect() error {
@@ -94,7 +84,6 @@ func (sc *SiblingConn) Connect() error {
 			sc.toConn = nil
 			return err
 		}
-		sc.timer = time.NewTimer(0)
 	}
 	return nil
 }
@@ -117,34 +106,18 @@ func (sc *SiblingConn) Run(ownNum int) {
 				continue
 			}
 
-			if !sc.timer.Stop() {
-				<-sc.timer.C
-			}
-			sc.timer.Reset(sc.timeout - 10*time.Millisecond)
-
 			br := bufio.NewReader(sc.toConn)
 
-			var req *RequestPack
 			for {
-				req = nil
+				req := <-sc.reqsChan
 
-				select {
-				case req = <-sc.reqsChan:
-					if _, err := sc.toConn.Write([]byte(dkvs.PrintMessage(req.msg) + "\n")); err != nil {
-						logErr.Println("Error while sending request to " + sc.toConn.RemoteAddr().String(), err)
-						sc.CloseBoth()
-						req.respBin <- "ERR " + err.Error()
-						break
-					}
-					logOk.Printf("SEND REQ to node %d: %s", sc.number, dkvs.PrintMessage(req.msg))
-				case <-sc.timer.C:
-					if _, err := sc.toConn.Write([]byte("ping\n")); err != nil {
-						logErr.Println("Error while sending ping to " + sc.toConn.RemoteAddr().String(), err)
-						sc.CloseBoth()
-						break
-					}
-					logOk.Printf("SEND PING to node %d", sc.number)
+				if _, err := sc.toConn.Write([]byte(dkvs.PrintMessage(req.msg) + "\n")); err != nil {
+					logErr.Println("Error while sending request to " + sc.toConn.RemoteAddr().String(), err)
+					sc.CloseTo()
+					req.respBin <- "ERR " + err.Error()
+					break
 				}
+				logOk.Printf("SEND REQ to node %d: %s", sc.number, dkvs.PrintMessage(req.msg))
 
 				sc.RLock()
 				if sc.toConn == nil {
@@ -157,41 +130,22 @@ func (sc *SiblingConn) Run(ownNum int) {
 				msg, _, err := br.ReadLine()
 				sc.RUnlock()
 
-				if err == io.EOF {
-					logErr.Println("Sibling " + remoteAddr + " closed connection prematurely")
-					sc.CloseBoth()
-
-					if req != nil {
-						req.respBin <- "ERR " + err.Error()
+				if err != nil {
+					if err == io.EOF {
+						logErr.Println("Sibling " + remoteAddr + " closed connection prematurely")
+					} else if netop, ok := err.(*net.OpError); ok && netop.Timeout() {
+						logErr.Println("Read timeout " + remoteAddr)
+					} else if err != nil {
+						logErr.Println("Error while getting response from sibling " + remoteAddr, err)
 					}
-					break
-				} else if netop, ok := err.(*net.OpError); ok && netop.Timeout() {
-					logErr.Println("Read timeout " + remoteAddr)
-					sc.CloseBoth()
 
-					if req != nil {
-						req.respBin <- "ERR " + err.Error()
-					}
-					break
-				} else if err != nil {
-					logErr.Println("Error while getting response from sibling " + remoteAddr, err)
 					sc.CloseBoth()
-
-					if req != nil {
-						req.respBin <- "ERR " + err.Error()
-					}
+					req.respBin <- "ERR " + err.Error()
 					break
 				}
 
 				logOk.Printf("RESP RECV from node %d: %s", sc.number, string(msg))
-				if req != nil {
-					req.respBin <- string(msg)
-				}
-
-				if !sc.timer.Stop() && req != nil {
-					<-sc.timer.C
-				}
-				sc.timer.Reset(sc.timeout - 10*time.Millisecond)
+				req.respBin <- string(msg)
 			}
 		}
 	}
@@ -279,5 +233,6 @@ func (node *ServerNode) BroadcastMessage(msg *dkvs.Message) chan string {
 
 		sib.SendRequest(req)
 	}
+
 	return aggregator
 }

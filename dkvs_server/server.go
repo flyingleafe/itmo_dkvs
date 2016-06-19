@@ -12,7 +12,6 @@ import (
 	"sync"
 	"strconv"
 	"strings"
-	"bytes"
 )
 
 type (
@@ -47,7 +46,13 @@ type (
 		opNumber     int64 // Number of last view-changing operation request (set/delete)
 		commitNumber int64 // Number of last commited change
 
+		normalViewNumber int64  // Last view number of normal state (used only while view changes)
+
 		commitTimer *time.Timer
+		lastCommit   time.Time
+
+		startViewChangeMsgs map[int]*dkvs.Message
+		doViewChangeMsgs    map[int]*dkvs.Message
 	}
 )
 
@@ -57,7 +62,7 @@ const (
 	Recovering
 )
 
-func MakeRequest(tp dkvs.MessageType, params ...string) *RequestPack {
+func MakeRequest(tp dkvs.MessageType, params ...interface{}) *RequestPack {
 	return &RequestPack{
 		msg: dkvs.MakeMessage(tp, params...),
 		opNum: -1,
@@ -86,9 +91,13 @@ func MakeNode(num int, journalFilename string, config *dkvs.ServerConfig) (*Serv
 		statusLock:   sync.RWMutex{},
 		leaderNumber: 1,
 		viewNumber:   0,
+		normalViewNumber: 0,
 		opNumber:     0,
 		commitNumber: 0,
 		commitTimer:  nil,
+		lastCommit:   time.Now(),
+		startViewChangeMsgs: make(map[int]*dkvs.Message),
+		doViewChangeMsgs: make(map[int]*dkvs.Message),
 	}, nil
 }
 
@@ -111,12 +120,12 @@ func (node *ServerNode) Start() error {
 	if aliveCount > (len(node.siblings) + 1) / 2 {
 		logOk.Println("Start recovering of state from nodes")
 		node.RecoveryNode()
+	} else {
+		node.ChangeStatus(Normal)
 	}
 
 	node.listener = ln
 	logOk.Printf("Started node on %s:%d\n", myAddr.Host, myAddr.Port)
-
-	node.ChangeStatus(Normal)
 
 	go func() {
 		needStop := atomic.LoadInt32(&node.needStop)
@@ -171,7 +180,6 @@ func (node *ServerNode) takeMessage(br *bufio.Reader, conn net.Conn) (*dkvs.Mess
 		return nil, false, err
 	}
 
-	logOk.Printf("QUERY (%s): %s\n", conn.RemoteAddr().String(), msg)
 	return mesg, false, nil
 }
 
@@ -200,6 +208,8 @@ func (node *ServerNode) Interact(conn net.Conn) {
 			}
 			continue
 		}
+
+		logOk.Printf("QUERY (%s): %s\n", conn.RemoteAddr().String(), dkvs.PrintMessage(mesg))
 
 		if mesg.Type == dkvs.MNode {
 			// This is sibling node wants to connect
@@ -250,8 +260,10 @@ func (node *ServerNode) InteractSibling(num int, conn net.Conn) {
 			continue
 		}
 
+		logOk.Printf("SERVICE QUERY (%s): %s\n", conn.RemoteAddr().String(), dkvs.PrintMessage(mesg))
+
 		curOpNum := int64(-1)
-		if node.Number == node.GetLeaderNumber() && dkvs.IsChangingOp(mesg) {
+		if node.status == Normal && node.Number == node.GetLeaderNumber() && dkvs.IsChangingOp(mesg) {
 			curOpNum = atomic.AddInt64(&node.opNumber, 1)
 		}
 
@@ -321,7 +333,7 @@ func (node *ServerNode) PerformAction(m *dkvs.Message) string {
 
 // Process all service messages
 func (node *ServerNode) ProcessServiceMsgs() {
-	node.resetCommitTimer()
+	node.resetCommitTimer(node.Config.Timeout * 2)
 	go func() {
 		needStop := atomic.LoadInt32(&node.needStop)
 		for ; needStop != 1; needStop = atomic.LoadInt32(&node.needStop) {
@@ -331,12 +343,22 @@ func (node *ServerNode) ProcessServiceMsgs() {
 
 	for req := range node.serviceMsgs {
 		node.statusLock.RLock()
-		node.ProcessServiceMsg(req)
+		switch node.status {
+		case Normal:
+			node.ProcessServiceNormal(req)
+		case Recovering:
+			node.ProcessServiceRecovering(req)
+		case ViewChange:
+			node.ProcessServiceViewChange(req)
+		}
 		node.statusLock.RUnlock()
 	}
 }
 
-func (node *ServerNode) resetCommitTimer() {
+func (node *ServerNode) resetCommitTimer(timeout time.Duration) {
+	if timeout == -1 {
+		timeout = node.Config.Timeout
+	}
 	if node.commitTimer == nil {
 		node.commitTimer = time.NewTimer(node.Config.Timeout)
 	} else {
@@ -351,49 +373,46 @@ func (node *ServerNode) resetCommitTimer() {
 }
 
 func (node *ServerNode) commitByTimer() {
-	if node.GetLeaderNumber() == node.Number {
-		<-node.commitTimer.C
+	curTime := <-node.commitTimer.C
+
+	lnum := node.GetLeaderNumber()
+	if lnum == node.Number {
+		node.lastCommit = curTime
 		node.CommitToAll()
-		node.resetCommitTimer()
 	} else {
-		node.statusLock.RLock()
-		node.WaitForStatus(ViewChange)
-		node.statusLock.RUnlock()
+		logOk.Println("TIME CHECK")
+		passedSinceLast := curTime.Sub(node.lastCommit)
+
+		if passedSinceLast > node.Config.Timeout + 200 * time.Millisecond {
+			logOk.Println("TIME IS OFFF!!!!")
+			node.siblings[lnum].CloseBoth()
+			node.InitViewChange()
+		}
 	}
+	node.resetCommitTimer(-1)
 }
 
-func (node *ServerNode) ProcessServiceMsg(req *RequestPack) {
+func (node *ServerNode) ProcessServiceNormal(req *RequestPack) {
 	m := req.msg
+
 	switch m.Type {
 	case dkvs.MRecovery:
-
-		// Start recovery only from normal status
-		node.WaitForStatus(Normal)
-
 		// nodeNum := m.Params[0]
 		nonce := m.Params[1]
 		vnum := atomic.LoadInt64(&node.viewNumber)
 		opNum := int64(-1)
 		comNum := int64(-1)
-		log := ""
+		log := "!"
 		if node.Number == node.leaderNumber {
 			opNum = atomic.LoadInt64(&node.opNumber)
 			comNum = atomic.LoadInt64(&node.commitNumber)
 			log, _ = node.FetchJournal()
 		}
-		respMsg := dkvs.MakeMessage(dkvs.MRecoveryResponse,
-			strconv.Itoa(node.Number),
-			nonce,
-			strconv.FormatInt(vnum, 10),
-			strconv.FormatInt(opNum, 10),
-			strconv.FormatInt(comNum, 10),
-			log,
-		)
+		respMsg := dkvs.MakeMessage(dkvs.MRecoveryResponse, node.Number, nonce, vnum, opNum, comNum, log)
 		req.respBin <- dkvs.PrintMessage(respMsg)
 
 	case dkvs.MPrepare:
-		// Commit changes only from normal status
-		node.WaitForStatus(Normal)
+		node.lastCommit = time.Now()
 
 		vnum, _ := strconv.ParseInt(m.Params[0], 10, 64)
 		onum, _ := strconv.ParseInt(m.Params[1], 10, 64)
@@ -408,12 +427,7 @@ func (node *ServerNode) ProcessServiceMsg(req *RequestPack) {
 
 		opNum := atomic.LoadInt64(&node.opNumber)
 
-		responseMsg := dkvs.PrintMessage(dkvs.MakeMessage(
-			dkvs.MPrepareOk,
-			strconv.FormatInt(vNum, 10),
-			strconv.FormatInt(opNum + 1, 10),
-			strconv.Itoa(node.Number),
-		))
+		responseMsg := dkvs.PrintMessage(dkvs.MakeMessage(dkvs.MPrepareOk, vNum, opNum + 1, node.Number))
 
 		if onum - 1 == opNum {
 			node.CommitTail(cnum)
@@ -423,13 +437,12 @@ func (node *ServerNode) ProcessServiceMsg(req *RequestPack) {
 		} else {
 			go func(){
 				node.RecoveryNode()
-				node.ChangeStatus(Normal)
 				req.respBin <- responseMsg
 			}()
 		}
 
 	case dkvs.MCommit:
-		node.WaitForStatus(Normal)
+		node.lastCommit = time.Now()
 
 		vnum, _ := strconv.ParseInt(m.Params[0], 10, 64)
 		cnum, _ := strconv.ParseInt(m.Params[1], 10, 64)
@@ -450,12 +463,97 @@ func (node *ServerNode) ProcessServiceMsg(req *RequestPack) {
 			} else {
 				go func(){
 					node.RecoveryNode()
-					node.ChangeStatus(Normal)
 					req.respBin <- "OK"
 				}()
 			}
 		}
 		req.respBin <- "OK"
+
+	case dkvs.MStartViewChange:
+		fallthrough
+	case dkvs.MDoViewChange:
+		vnum, _ := strconv.ParseInt(m.Params[0], 10, 64)
+
+		req.respBin <- "OK"
+
+		if vnum > node.viewNumber {
+			go node.InitViewChange()
+		}
+
+	default:
+		req.respBin <- "ERR Invalid status"
+	}
+}
+
+func (node *ServerNode) ProcessServiceRecovering(req *RequestPack) {
+	node.WaitForStatus(Normal)
+	node.ProcessServiceNormal(req)
+}
+
+func (node *ServerNode) ProcessServiceViewChange(req *RequestPack) {
+	m := req.msg
+
+	switch m.Type {
+	case dkvs.MStartViewChange:
+		vnum, _ := strconv.ParseInt(m.Params[0], 10, 64)
+		nnum, _ := strconv.Atoi(m.Params[1])
+
+		logOk.Printf("VIEW CHANGE VOTE: vnum = %d, vNumber = %d", vnum, node.viewNumber)
+
+		if vnum == node.viewNumber {
+			node.startViewChangeMsgs[nnum] = m
+			f := (len(node.siblings) + 1) / 2
+
+			logOk.Printf("CHECK CONSENSUS THRESHOLD: f = %d, %d calls received", f, len(node.startViewChangeMsgs))
+
+			if len(node.startViewChangeMsgs) == f {
+				logOk.Println("ISSUE NEXT LEADER SELECTION")
+				go node.DoViewChange()
+			}
+		}
+
+		req.respBin <- "OK"
+
+	case dkvs.MDoViewChange:
+		// ovnum, _ := strconv.ParseInt(m.Params[0], 10, 64)
+		vnum, _ := strconv.ParseInt(m.Params[1], 10, 64)
+		// opnum, _ := strconv.ParseInt(m.Params[2], 10, 64)
+		// cnum, _ := strconv.ParseInt(m.Params[3], 10, 64)
+		nnum, _ := strconv.Atoi(m.Params[4])
+
+
+		if vnum == node.viewNumber {
+			node.doViewChangeMsgs[nnum] = m
+			f := (len(node.siblings) + 1) / 2
+
+			logOk.Printf("RECEIVED do_view_change FROM NODE %d (view %d, %d votes already)", nnum, vnum, len(node.doViewChangeMsgs))
+
+			if len(node.doViewChangeMsgs) == f + 1 {
+				logOk.Println("ISSUE NEW VIEW STARTING")
+				go node.StartNewView()
+			}
+
+			req.respBin <- "OK"
+		} else {
+			req.respBin <- "ERR Invalid view number"
+		}
+
+	case dkvs.MStartView:
+
+		logOk.Println("START VIEW RECEIVED")
+
+		vnum, _ := strconv.ParseInt(m.Params[0], 10, 64)
+		nnum, _ := strconv.Atoi(m.Params[1])
+		cnum, _ := strconv.ParseInt(m.Params[2], 10, 64)
+
+		node.RefreshJounalState(m.Params[3], cnum, vnum)
+		node.leaderNumber = nnum
+		node.changeStatus(Normal)
+		node.lastCommit = time.Now()
+		node.resetCommitTimer(-1)
+
+		req.respBin <- "OK"
+
 	}
 }
 
@@ -473,17 +571,25 @@ func (node *ServerNode) WaitForStatus(statuses ...NodeStatus) {
 	}
 }
 
-func (node *ServerNode) ChangeStatus(newStatus NodeStatus) {
+func (node *ServerNode) ChangeStatus(newStatus NodeStatus) bool {
 	node.statusLock.Lock()
+	res := node.changeStatus(newStatus)
+	node.statusLock.Unlock()
+	return res
+}
 
+func (node *ServerNode) changeStatus(newStatus NodeStatus) bool {
 	prevStatus := node.status
 	node.status = newStatus
 
-	node.statusLock.Unlock()
-
 	if prevStatus != newStatus {
-		node.statusChan <- true
+		select {
+		case node.statusChan <- true:
+		default:
+		}
+		return true
 	}
+	return false
 }
 
 func (node *ServerNode) GetStatus() NodeStatus {
@@ -495,7 +601,7 @@ func (node *ServerNode) GetStatus() NodeStatus {
 
 func (node *ServerNode) GetLeaderNumber() int {
 	node.statusLock.RLock()
-	node.WaitForStatus(Normal, Recovering)
+	node.WaitForStatus(Normal)
 	lnum := node.leaderNumber
 	node.statusLock.RUnlock()
 	return lnum
@@ -503,7 +609,7 @@ func (node *ServerNode) GetLeaderNumber() int {
 
 func (node *ServerNode) SetLeaderNumber(newLeader int) {
 	node.statusLock.RLock()
-	node.WaitForStatus(ViewChange)
+	node.WaitForStatus(ViewChange, Recovering)
 	node.leaderNumber = newLeader
 	node.statusLock.RUnlock()
 }
@@ -512,14 +618,9 @@ func (node *ServerNode) PrepareRequestToAll(req *RequestPack) {
 	comNum := atomic.LoadInt64(&node.commitNumber)
 	viewNum := atomic.LoadInt64(&node.viewNumber)
 
-	msg := dkvs.MakeMessage(dkvs.MPrepare,
-		strconv.FormatInt(viewNum, 10),
-		strconv.FormatInt(req.opNum, 10),
-		strconv.FormatInt(comNum, 10),
-		dkvs.PrintMessage(req.msg),
-	)
+	msg := dkvs.MakeMessage(dkvs.MPrepare, viewNum, req.opNum, comNum, req.msg)
 
-	node.resetCommitTimer()
+	node.resetCommitTimer(-1)
 
 	OuterLoop: for {
 		agg := node.BroadcastMessage(msg)
@@ -540,17 +641,14 @@ func (node *ServerNode) PrepareRequestToAll(req *RequestPack) {
 	resp := node.PerformAction(req.msg)
 	atomic.AddInt64(&node.commitNumber, 1)
 	req.respBin <- resp
-	node.resetCommitTimer()
+	node.resetCommitTimer(-1)
 }
 
 func (node *ServerNode) CommitToAll() {
 	comNum := atomic.LoadInt64(&node.commitNumber)
 	viewNum := atomic.LoadInt64(&node.viewNumber)
 
-	msg := dkvs.MakeMessage(dkvs.MCommit,
-		strconv.FormatInt(viewNum, 10),
-		strconv.FormatInt(comNum, 10),
-	)
+	msg := dkvs.MakeMessage(dkvs.MCommit, viewNum, comNum)
 
 	logOk.Println("COMMIT BROADCAST")
 	node.BroadcastMessage(msg)
@@ -558,13 +656,14 @@ func (node *ServerNode) CommitToAll() {
 
 func (node *ServerNode) RecoveryNode() {
 	node.ChangeStatus(Recovering)
+
 	nonce := dkvs.RandSeq(10)
 	msg := dkvs.MakeMessage(dkvs.MRecovery, strconv.Itoa(node.Number), nonce)
 
 	log := ""
 	vNum := int64(-1)
-	opNum := int64(-1)
 	comNum := int64(-1)
+	leaderNum := -1
 
 	retries := 0
 	OuterLoop: for {
@@ -574,21 +673,20 @@ func (node *ServerNode) RecoveryNode() {
 		f := (len(node.siblings) + 1) / 2
 
 		countReady := 0
-		hadLeader := false
+		leaderNum = -1
 
 		for i := 0; i < len(node.siblings); i++ {
 			resp := <-agg
-			_, theirNonce, vnum, opnum, comnum, logOut, err := dkvs.ParseRecoveryResponse(resp)
+			nnum, theirNonce, vnum, _, comnum, logOut, err := dkvs.ParseRecoveryResponse(resp)
 			if err == nil && nonce == theirNonce {
 				countReady++
 				if comnum != -1 {
 					vNum = vnum
-					opNum = opnum
 					comNum = comnum
 					log = logOut
-					hadLeader = true
+					leaderNum = nnum
 				}
-				if hadLeader && countReady > f {
+				if leaderNum != -1 && countReady > f {
 					break OuterLoop
 				}
 			}
@@ -596,13 +694,120 @@ func (node *ServerNode) RecoveryNode() {
 		retries++
 	}
 
-	newLog := []byte(strings.Replace(log, ";", "\n", -1))
-	node.SubstituteJournal(bytes.NewBuffer(newLog))
-	node.RestoreFromJournal(comNum)
-
-	atomic.StoreInt64(&node.viewNumber, vNum)
-	atomic.StoreInt64(&node.opNumber, opNum)
-	atomic.StoreInt64(&node.commitNumber, comNum)
-
+	node.RefreshJounalState(log, comNum, vNum)
+	node.SetLeaderNumber(leaderNum)
 	logOk.Println("Recovery completed")
+
+	node.ChangeStatus(Normal)
+}
+
+func (node *ServerNode) InitViewChange() {
+	node.statusLock.Lock()
+
+	// We don't need to start view change again, if we are already busy with that
+	if node.status == ViewChange {
+		node.statusLock.Unlock()
+		return
+	}
+
+	node.changeStatus(ViewChange)
+
+	atomic.StoreInt64(&node.normalViewNumber, atomic.LoadInt64(&node.viewNumber))
+	newVnum := atomic.AddInt64(&node.viewNumber, 1)
+
+	node.startViewChangeMsgs = make(map[int]*dkvs.Message)
+	node.doViewChangeMsgs = make(map[int]*dkvs.Message)
+
+	startViewChangeMsg := dkvs.MakeMessage(dkvs.MStartViewChange, newVnum, node.Number)
+
+	logOk.Println("START VIEW CHANGE BROADCAST")
+	node.BroadcastMessage(startViewChangeMsg)
+
+	node.statusLock.Unlock()
+}
+
+func (node *ServerNode) DoViewChange() {
+	node.statusLock.Lock()
+
+	oldVnum := atomic.LoadInt64(&node.normalViewNumber)
+	newVnum := atomic.LoadInt64(&node.viewNumber)
+	opNum := atomic.LoadInt64(&node.opNumber)
+	commNum := atomic.LoadInt64(&node.commitNumber)
+	log, _ := node.FetchJournal()
+
+	doViewChangeMsg := dkvs.MakeMessage(dkvs.MDoViewChange, oldVnum, newVnum, opNum, commNum, node.Number, log)
+
+	nextLeader := node.leaderNumber
+	req := &RequestPack{
+		msg: doViewChangeMsg,
+		opNum: -1,
+		respBin: make(chan string, 1),
+	}
+
+	for {
+		nextLeader = (nextLeader + 1) % (len(node.siblings) + 2)
+		if nextLeader == 0 {
+			nextLeader = 1
+		}
+
+		logOk.Printf("DO VIEW CHANGE TO %d", nextLeader)
+
+		if nextLeader == node.Number {
+			node.serviceMsgs <- req
+		} else {
+			node.siblings[nextLeader].SendRequest(req)
+		}
+
+		node.statusLock.Unlock()
+		ans := <-req.respBin
+		node.statusLock.Lock()
+
+		if ans == "OK" {
+			break
+		}
+	}
+
+	node.leaderNumber = nextLeader
+	node.statusLock.Unlock()
+}
+
+func (node *ServerNode) StartNewView() {
+	node.statusLock.Lock()
+
+	maxCommit := int64(0)
+	maxOldView := int64(0)
+	maxOpNum := int64(0)
+	var maxMsg *dkvs.Message = nil
+
+	if len(node.doViewChangeMsgs) == 0 {
+		panic("COME ON DAT's IMPOSSIBLE!")
+	}
+
+	for _, m := range node.doViewChangeMsgs {
+		ovnum, _ := strconv.ParseInt(m.Params[0], 10, 64)
+		opnum, _ := strconv.ParseInt(m.Params[2], 10, 64)
+		cnum, _ := strconv.ParseInt(m.Params[3], 10, 64)
+
+		if maxCommit < cnum {
+			maxCommit = cnum
+		}
+
+		if maxOldView < ovnum || (maxOldView == ovnum && maxOpNum < opnum) {
+			maxOldView = ovnum
+			maxOpNum = opnum
+			maxMsg = m
+		}
+	}
+
+	viewNum, _ := strconv.ParseInt(maxMsg.Params[1], 10, 64)
+
+	node.RefreshJounalState(maxMsg.Params[5], maxCommit, viewNum)
+	startMsg := dkvs.MakeMessage(dkvs.MStartView, viewNum, node.Number, maxCommit, maxMsg.Params[5])
+
+	node.BroadcastMessage(startMsg)
+	node.changeStatus(Normal)
+	node.lastCommit = time.Now()
+	node.resetCommitTimer(-1)
+
+	node.statusLock.Unlock()
 }

@@ -174,5 +174,19 @@ func (node *ServerNode) FetchJournal() (string, error) {
 		return "", err
 	}
 
-	return strings.Replace(string(contents), "\n", ";", -1), nil
+	return "!" + strings.Replace(string(contents), "\n", ";", -1), nil
+}
+
+func (node *ServerNode) RefreshJounalState(log string, commNum int64, viewNum int64) error {
+	newLog := []byte(strings.Replace(log[1:], ";", "\n", -1))
+	if err := node.SubstituteJournal(bytes.NewBuffer(newLog)); err != nil {
+		return err
+	}
+
+	if err := node.RestoreFromJournal(commNum); err != nil {
+		return err
+	}
+
+	atomic.StoreInt64(&node.viewNumber, viewNum)
+	return nil
 }

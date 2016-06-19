@@ -96,11 +96,27 @@ func msgTypeToString(t MessageType) string {
 }
 
 
-func MakeMessage(tp MessageType, params ...string) *Message {
-	return &Message{tp, params}
+func MakeMessage(tp MessageType, params ...interface{}) *Message {
+	strParams := make([]string, 0)
+
+	for _, param := range params {
+		switch v := param.(type) {
+		case int:
+			strParams = append(strParams, strconv.Itoa(v))
+		case int64:
+			strParams = append(strParams, strconv.FormatInt(v, 10))
+		case string:
+			strParams = append(strParams, v)
+		case *Message:
+			strParams = append(strParams, PrintMessage(v))
+		}
+	}
+
+	return &Message{tp, strParams}
 }
 
 func ParseMessage(s string) (*Message, error) {
+	s = strings.Join(strings.Fields(s), " ")
 	parts := strings.SplitN(s, " ", 2)
 	if len(parts) < 1 {
 		return nil, fmt.Errorf("Empty message")
